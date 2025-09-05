@@ -109,6 +109,24 @@ def _try_int(x):
 def _parse_dt(s):
     try: return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
     except: return None
+def _to_float_or_none(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+def fmt1(x):  # 1-decimal with thousands
+    v = _to_float_or_none(x)
+    return "-" if v is None else f"{v:,.1f}"
+
+def fmt_money_mn(x):  # ₹ … mn, 1-decimal
+    v = _to_float_or_none(x)
+    return "-" if v is None else f"₹ {v:,.1f} mn"
+
+def fmt_pct(x):  # 1-decimal % (no thousands)
+    v = _to_float_or_none(x)
+    return "-" if v is None else f"{v:.1f} %"
+
 
 def fetch_preview_doc(company_query: str) -> Optional[Dict[str, Any]]:
     q = (company_query or "").strip()
@@ -139,6 +157,10 @@ def chip(text, kind=None):
     st.markdown(f'<span class="badge {kind}">{text}</span>', unsafe_allow_html=True)
 
 def build_broker_df(preview: Dict[str, Any]) -> pd.DataFrame:
+    def r1(x):
+        v = _to_float_or_none(x)
+        return round(v, 1) if v is not None else None
+
     rows = []
     for b in (preview.get("broker_estimates") or []):
         pdf_name = b.get("source_file") or b.get("report_id") or ""
@@ -146,15 +168,23 @@ def build_broker_df(preview: Dict[str, Any]) -> pd.DataFrame:
         rows.append({
             "Broker": b.get("broker_name"),
             "Published": (b.get("published_date","") or "")[:10],
-            "Expected Sales (₹ mn)": b.get("expected_sales"),
-            "Expected EBITDA (₹ mn)": b.get("expected_ebitda"),
-            "Expected PAT (₹ mn)": b.get("expected_pat"),
-            "EBITDA Margin %": b.get("ebitda_margin_percent"),
-            "PAT Margin %": b.get("pat_margin_percent"),
+            "Expected Sales (₹ mn)": r1(b.get("expected_sales")),
+            "Expected EBITDA (₹ mn)": r1(b.get("expected_ebitda")),
+            "Expected PAT (₹ mn)": r1(b.get("expected_pat")),
+            "EBITDA Margin %": r1(b.get("ebitda_margin_percent")),
+            "PAT Margin %": r1(b.get("pat_margin_percent")),
             "Commentary": b.get("commentary",""),
             "PDF": source_url or pdf_name,
         })
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+
+    # Ensure any numeric-looking objects are coerced & rounded to 1dp
+    for c in ["Expected Sales (₹ mn)","Expected EBITDA (₹ mn)","Expected PAT (₹ mn)",
+              "EBITDA Margin %","PAT Margin %"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").round(1)
+    return df
+
 
 # ---------- NEW: Dropdown options (only companies that have news) ----------
 @st.cache_data(ttl=600)
@@ -227,19 +257,33 @@ def render_actual_card(doc: Dict[str, Any]):
     # Sentiment / impact — bold & eye-catching pills in ONE block
     sentiment = doc.get("sentiment", "-")
     scls = "negative" if "neg" in sentiment.lower() else ("positive" if "pos" in sentiment.lower() else "")
+    # Pills block (keep your existing sentiment/sensitivity/timeline lines)
     pills = [
         f'<span class="pill {scls}"><b>Sentiment:</b>&nbsp;{sentiment}</span>',
         f'<span class="pill"><b>Sensitivity:</b>&nbsp;{doc.get("sensitivity","-")}</span>',
         f'<span class="pill"><b>Timeline:</b>&nbsp;{doc.get("timelineflag")}</span>',
-        f'<span class="pill"><b>Impact Score:</b>&nbsp;{doc.get("impactscore","-")}/10</span>',
+        f'<span class="pill"><b>Impact Score:</b>&nbsp;{fmt1(doc.get("impactscore"))}/10</span>',
     ]
     st.markdown(f'<div class="pills">{"".join(pills)}</div>', unsafe_allow_html=True)
+    
+    # Progress bar (numeric value, not formatted string)
+    score_f = _to_float_or_none(doc.get("impactscore")) or 0.0
+    st.progress(max(0.0, min(1.0, score_f/10.0)))
 
-    # Optional progress bar (kept)
-    try:
-        st.progress(float(doc.get("impactscore", 0)) / 10.0)
-    except:
-        st.progress(0.0)
+    # st.markdown(f'<div class="pills">{"".join(pills)}</div>', unsafe_allow_html=True)
+
+    # # Optional progress bar (kept)
+    # try:
+    #     st.progress(float(doc.get("impactscore", 0)) / 10.0)
+    # except:
+    #     st.progress(0.0)
+
+    # Impact (NEW) — shown before Short Summary
+    impact_txt = (doc.get("impact") or "").strip()
+    if impact_txt:
+        st.markdown('<div class="section-title">Impact</div>', unsafe_allow_html=True)
+        st.write(impact_txt)
+
 
     # Short & Detailed summaries
     if doc.get("shortsummary"):
@@ -310,21 +354,24 @@ if preview:
 
     # Consensus KPIs
     cons = preview.get("consensus") or {}
-    kpi_cols = st.columns(5)
-    kpi_map = [
-        ("Expected Sales", cons.get("expected_sales",{}).get("mean")),
-        ("Expected EBITDA", cons.get("expected_ebitda",{}).get("mean")),
-        ("Expected PAT", cons.get("expected_pat",{}).get("mean")),
-        ("EBITDA Margin %", cons.get("ebitda_margin_percent",{}).get("mean")),
-        ("PAT Margin %", cons.get("pat_margin_percent",{}).get("mean")),
+
+    kpis = [
+        ("Expected Sales",  fmt_money_mn((cons.get("expected_sales") or {}).get("mean"))),
+        ("Expected EBITDA", fmt_money_mn((cons.get("expected_ebitda") or {}).get("mean"))),
+        ("Expected PAT",    fmt_money_mn((cons.get("expected_pat") or {}).get("mean"))),
+        ("EBITDA Margin %", fmt_pct((cons.get("ebitda_margin_percent") or {}).get("mean"))),
+        ("PAT Margin %",    fmt_pct((cons.get("pat_margin_percent") or {}).get("mean"))),
     ]
-    for col, (label, val) in zip(kpi_cols, kpi_map):
+    
+    kpi_cols = st.columns(len(kpis))
+    for col, (label, val_str) in zip(kpi_cols, kpis):
         with col:
             st.markdown(
                 f'<div class="kpi"><div class="small">{label}</div>'
-                f'<div style="font-size:20px;font-weight:700">{val if val is not None else "-"}</div></div>',
+                f'<div style="font-size:20px;font-weight:700">{val_str}</div></div>',
                 unsafe_allow_html=True
             )
+
 
     # Broker table
     df = build_broker_df(preview)
