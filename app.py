@@ -264,7 +264,7 @@ def render_actual_card(doc: Dict[str, Any]):
         f'<span class="pill {scls}"><b>Sentiment:</b>&nbsp;{sentiment}</span>',
         f'<span class="pill"><b>Sensitivity:</b>&nbsp;{doc.get("sensitivity","-")}</span>',
         f'<span class="pill"><b>Timeline:</b>&nbsp;{doc.get("timelineflag")}</span>',
-        f'<span class="pill"><b>Impact Score:</b>&nbsp;{fmt1(doc.get("impactscore"))}/10</span>',
+        f'<span class="pill"><b>Impact Score:</b>&nbsp;{int(doc.get("impactscore"))}/10</span>',
     ]
     st.markdown(f'<div class="pills">{"".join(pills)}</div>', unsafe_allow_html=True)
     
