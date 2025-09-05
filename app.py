@@ -44,6 +44,26 @@ st.markdown("""
 .section-title{font-weight:700;margin:6px 0 10px 0}
 </style>
 """, unsafe_allow_html=True)
+st.markdown("""
+<style>
+/* --- Horizontal header + compact pills --- */
+.header-line{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.company-name{font-size:20px;font-weight:800;letter-spacing:.2px}
+.meta{color:#666;font-size:12px}
+
+.pills{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:6px}
+.pill{
+  display:inline-flex;align-items:center;
+  padding:6px 12px;border-radius:999px;
+  background:#eef;color:#222;font-weight:700;font-size:13px
+}
+.pill.primary{background:#edf3ff;color:#1b3a8a}
+.pill.positive{background:#e8f8ef;color:#0b6b2f}
+.pill.negative{background:#ffe8e8;color:#a00}
+.section-title{font-weight:800;margin:10px 0 8px 0}
+</style>
+""", unsafe_allow_html=True)
+
 
 # -------------------- AUTH --------------------
 # Initialize your own session keys (avoid "auth" name clash with form keys)
@@ -180,38 +200,42 @@ def fetch_actual_docs(opt: Dict[str, Any], limit: int = 50) -> List[Dict[str, An
 def render_actual_card(doc: Dict[str, Any]):
     sym = doc.get("symbolmap", {}) or {}
     company = sym.get("Company_Name") or sym.get("NSE") or "Company"
+    filed = doc.get("dt_tm", "")
 
     # Header (horizontal)
     st.markdown('<div class="header-card">', unsafe_allow_html=True)
-    st.markdown('<div class="header-grid">', unsafe_allow_html=True)
-    st.markdown(f"<div><b style='font-size:18px'>{company}</b></div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='meta'>Filed: {doc.get('dt_tm','')}</div>", unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <div class="header-line">
+          <div class="company-name">{company}</div>
+          <div class="meta">Filed: {filed}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
-    # Chip line (horizontal)
+    # Company identifiers — one HTML block (horizontal pills)
     chips = []
-    if sym.get("NSE"): chips.append(f"NSE {sym.get('NSE')}")
-    if sym.get("BSE"): chips.append(f"BSE {sym.get('BSE')}")
-    if doc.get("company"): chips.append(f"ISIN {doc.get('company')}")
-    if doc.get("category"): chips.append(doc.get("category"))
-    if doc.get("subcategory"): chips.append(doc.get("subcategory"))
+    if sym.get("NSE"): chips.append(f'<span class="pill primary">NSE {sym.get("NSE")}</span>')
+    if sym.get("BSE"): chips.append(f'<span class="pill primary">BSE {sym.get("BSE")}</span>')
+    if doc.get("company"): chips.append(f'<span class="pill primary">ISIN {doc.get("company")}</span>')
+    if doc.get("category"): chips.append(f'<span class="pill">{doc.get("category")}</span>')
+    if doc.get("subcategory"): chips.append(f'<span class="pill">{doc.get("subcategory")}</span>')
+    st.markdown(f'<div class="pills">{"".join(chips)}</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)  # close header-card
 
-    st.markdown('<div class="row">', unsafe_allow_html=True)
-    for c in chips:
-        st.markdown(f'<span class="badge">{c}</span>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)  # end header-card
+    # Sentiment / impact — bold & eye-catching pills in ONE block
+    sentiment = doc.get("sentiment", "-")
+    scls = "negative" if "neg" in sentiment.lower() else ("positive" if "pos" in sentiment.lower() else "")
+    pills = [
+        f'<span class="pill {scls}"><b>Sentiment:</b>&nbsp;{sentiment}</span>',
+        f'<span class="pill"><b>Sensitivity:</b>&nbsp;{doc.get("sensitivity","-")}</span>',
+        f'<span class="pill"><b>Timeline:</b>&nbsp;{doc.get("timelineflag")}</span>',
+        f'<span class="pill"><b>Impact Score:</b>&nbsp;{doc.get("impactscore","-")}/10</span>',
+    ]
+    st.markdown(f'<div class="pills">{"".join(pills)}</div>', unsafe_allow_html=True)
 
-    # Sentiment / impact row
-    snt = (doc.get("sentiment") or "").lower()
-    snt_kind = "neg" if "neg" in snt else ("pos" if "pos" in snt else "")
-    st.markdown('<div class="news-card">', unsafe_allow_html=True)
-    st.markdown('<div class="row">', unsafe_allow_html=True)
-    st.markdown(f'<span class="badge {snt_kind}">Sentiment: {doc.get("sentiment","-")}</span>', unsafe_allow_html=True)
-    st.markdown(f'<span class="badge">Sensitivity: {doc.get("sensitivity","-")}</span>', unsafe_allow_html=True)
-    st.markdown(f'<span class="badge">Timeline: {doc.get("timelineflag")}</span>', unsafe_allow_html=True)
-    st.markdown(f'<span class="badge">Impact Score: {doc.get("impactscore","-")}/10</span>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+    # Optional progress bar (kept)
     try:
         st.progress(float(doc.get("impactscore", 0)) / 10.0)
     except:
@@ -221,6 +245,7 @@ def render_actual_card(doc: Dict[str, Any]):
     if doc.get("shortsummary"):
         st.markdown('<div class="section-title">Short Summary</div>', unsafe_allow_html=True)
         st.write(doc["shortsummary"])
+
     if doc.get("summary"):
         st.markdown('<div class="section-title">Detailed Summary</div>', unsafe_allow_html=True)
         st.write(doc["summary"])
@@ -236,7 +261,6 @@ def render_actual_card(doc: Dict[str, Any]):
     with st.expander("Raw JSON"):
         st.json(doc)
 
-    st.markdown('</div>', unsafe_allow_html=True)  # end news-card
 
 # -------------------- UI --------------------
 with st.sidebar:
