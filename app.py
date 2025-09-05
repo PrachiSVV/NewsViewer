@@ -34,12 +34,18 @@ st.markdown("""
 .tbl th, .tbl td{padding:10px 8px;border-bottom:1px solid #f0f0f0;font-size:14px}
 .tbl th{font-weight:600;background:#fafafa}
 .small{color:#666;font-size:12px}
+
+/* New layout helpers */
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.header-card{border:1px solid #eee;border-radius:12px;padding:14px 16px;margin:10px 0;background:#fff}
+.header-grid{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center}
+.meta{color:#666;font-size:12px}
+.news-card{border:1px solid #eee;border-radius:12px;padding:14px 16px;margin:16px 0;background:#fff}
+.section-title{font-weight:700;margin:6px 0 10px 0}
 </style>
 """, unsafe_allow_html=True)
 
 # -------------------- AUTH --------------------
-
-
 # Initialize your own session keys (avoid "auth" name clash with form keys)
 if "is_authed" not in st.session_state:
     st.session_state.is_authed = False
@@ -48,7 +54,6 @@ if "remember_me" not in st.session_state:
 
 def login_view():
     st.title("🔒 Login")
-
     # Use a different form key and widget keys to avoid collisions
     with st.form("login_form"):
         u = st.text_input("Username", key="login_user")
@@ -69,7 +74,6 @@ if not st.session_state.get("is_authed"):
     login_view()
     st.stop()
 
-
 # -------------------- DB --------------------
 client = MongoClient(MONGO_URI)
 db_news = client[DB_NAME]
@@ -86,29 +90,6 @@ def _parse_dt(s):
     try: return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
     except: return None
 
-def fetch_actual_doc(company_query: str) -> Optional[Dict[str, Any]]:
-    q = (company_query or "").strip()
-    if not q:
-        return None
-    scrip = _try_int(q)
-    or_filters = [
-        {"symbolmap.NSE": q.upper()},
-        {"symbolmap.SELECTED": q.upper()},
-        {"company": q},  # ISIN
-        {"symbolmap.Company_Name": {"$regex": q, "$options":"i"}},
-    ]
-    if scrip is not None:
-        or_filters.append({"scrip_cd": scrip})
-        or_filters.append({"symbolmap.BSE": scrip})
-    docs = list(col_news.find({"$or": or_filters}))
-    if not docs: 
-        return None
-    def keyer(d):
-        dt = _parse_dt(d.get("dt_tm","") or "")
-        return dt or datetime.min
-    docs.sort(key=keyer, reverse=True)
-    return docs[0]
-
 def fetch_preview_doc(company_query: str) -> Optional[Dict[str, Any]]:
     q = (company_query or "").strip()
     if not q:
@@ -121,7 +102,7 @@ def fetch_preview_doc(company_query: str) -> Optional[Dict[str, Any]]:
         {"symbolmap.Company_Name": {"$regex": q, "$options":"i"}},
     ]
     docs = list(col_prev.find({"$or": or_filters}))
-    if not docs: 
+    if not docs:
         return None
     def keyer(d):
         for k in ("updated_at","created_at"):
@@ -155,89 +136,151 @@ def build_broker_df(preview: Dict[str, Any]) -> pd.DataFrame:
         })
     return pd.DataFrame(rows)
 
+# ---------- NEW: Dropdown options (only companies that have news) ----------
+@st.cache_data(ttl=600)
+def get_company_options() -> List[Dict[str, Any]]:
+    """
+    Build a dropdown list of companies that have news in NEWS_COLL.
+    Label: Company_Name — NSE X | BSE Y | ISIN Z  (count)
+    """
+    pipeline = [
+        {"$group": {"_id": {
+            "nse": "$symbolmap.NSE",
+            "bse": "$symbolmap.BSE",
+            "name": "$symbolmap.Company_Name",
+            "isin": "$company"
+        }, "count": {"$sum": 1}}},
+        {"$sort": {"_id.name": 1}}
+    ]
+    items = list(col_news.aggregate(pipeline))
+    out = []
+    for it in items:
+        _id = it["_id"] or {}
+        nse = _id.get("nse")
+        bse = _id.get("bse")
+        name = _id.get("name")
+        isin = _id.get("isin")
+        label = f"{name or nse or isin or bse} — NSE {nse or '-'} | BSE {bse or '-'} | ISIN {isin or '-'}  ({it['count']})"
+        out.append({"label": label, "nse": nse, "bse": bse, "name": name, "isin": isin, "count": it["count"]})
+    return out
+
+# ---------- NEW: Fetch ALL news docs for selected company ----------
+def fetch_actual_docs(opt: Dict[str, Any], limit: int = 50) -> List[Dict[str, Any]]:
+    """Fetch news docs for the selected company, newest first."""
+    ors = []
+    if opt.get("nse"):  ors.append({"symbolmap.NSE": opt["nse"]})
+    if opt.get("bse"):  ors.append({"symbolmap.BSE": opt["bse"]})
+    if opt.get("isin"): ors.append({"company": opt["isin"]})
+    if opt.get("name"): ors.append({"symbolmap.Company_Name": opt["name"]})
+    if not ors: return []
+    # dt_tm is "YYYY-MM-DD HH:MM:SS" so string sort works for chronological order
+    return list(col_news.find({"$or": ors}).sort("dt_tm", -1).limit(limit))
+
+# ---------- NEW: Cleaner horizontal header + content ----------
+def render_actual_card(doc: Dict[str, Any]):
+    sym = doc.get("symbolmap", {}) or {}
+    company = sym.get("Company_Name") or sym.get("NSE") or "Company"
+
+    # Header (horizontal)
+    st.markdown('<div class="header-card">', unsafe_allow_html=True)
+    st.markdown('<div class="header-grid">', unsafe_allow_html=True)
+    st.markdown(f"<div><b style='font-size:18px'>{company}</b></div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='meta'>Filed: {doc.get('dt_tm','')}</div>", unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # Chip line (horizontal)
+    chips = []
+    if sym.get("NSE"): chips.append(f"NSE {sym.get('NSE')}")
+    if sym.get("BSE"): chips.append(f"BSE {sym.get('BSE')}")
+    if doc.get("company"): chips.append(f"ISIN {doc.get('company')}")
+    if doc.get("category"): chips.append(doc.get("category"))
+    if doc.get("subcategory"): chips.append(doc.get("subcategory"))
+
+    st.markdown('<div class="row">', unsafe_allow_html=True)
+    for c in chips:
+        st.markdown(f'<span class="badge">{c}</span>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)  # end header-card
+
+    # Sentiment / impact row
+    snt = (doc.get("sentiment") or "").lower()
+    snt_kind = "neg" if "neg" in snt else ("pos" if "pos" in snt else "")
+    st.markdown('<div class="news-card">', unsafe_allow_html=True)
+    st.markdown('<div class="row">', unsafe_allow_html=True)
+    st.markdown(f'<span class="badge {snt_kind}">Sentiment: {doc.get("sentiment","-")}</span>', unsafe_allow_html=True)
+    st.markdown(f'<span class="badge">Sensitivity: {doc.get("sensitivity","-")}</span>', unsafe_allow_html=True)
+    st.markdown(f'<span class="badge">Timeline: {doc.get("timelineflag")}</span>', unsafe_allow_html=True)
+    st.markdown(f'<span class="badge">Impact Score: {doc.get("impactscore","-")}/10</span>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+    try:
+        st.progress(float(doc.get("impactscore", 0)) / 10.0)
+    except:
+        st.progress(0.0)
+
+    # Short & Detailed summaries
+    if doc.get("shortsummary"):
+        st.markdown('<div class="section-title">Short Summary</div>', unsafe_allow_html=True)
+        st.write(doc["shortsummary"])
+    if doc.get("summary"):
+        st.markdown('<div class="section-title">Detailed Summary</div>', unsafe_allow_html=True)
+        st.write(doc["summary"])
+
+    # PDF links
+    live = doc.get("pdf_link_live"); hist = doc.get("pdf_link")
+    if live or hist:
+        st.markdown('<div class="section-title">PDF Links</div>', unsafe_allow_html=True)
+        if live: st.markdown(f"- [Open Live PDF]({live})")
+        if hist: st.markdown(f"- [Open Historical PDF]({hist})")
+
+    # Raw JSON (collapsed)
+    with st.expander("Raw JSON"):
+        st.json(doc)
+
+    st.markdown('</div>', unsafe_allow_html=True)  # end news-card
+
 # -------------------- UI --------------------
 with st.sidebar:
-    st.markdown("### 🔍 Find Company")
-    q_default = st.session_state.get("company_query", "COROMANDEL")
-    company_query = st.text_input("NSE / BSE / ISIN / Name", value=q_default)
-    go = st.button("Fetch")
-    if go:
-        st.session_state["company_query"] = company_query
-        st.rerun()
+    st.markdown("### 🔍 Company (only those with news)")
+    options = get_company_options()
+    if not options:
+        st.error("No companies found in news collection.")
+        st.stop()
+
+    # Number of news items to append (newest first)
+    # Default: min(20, count of first option)
+    default_max = min(20, max(1, options[0]["count"]))
+    max_items = st.slider("Max news to show", 1, 50, default_max, help="Show up to N latest news items")
+    selected = st.selectbox(
+        "Search & select",
+        options,
+        index=0,
+        format_func=lambda o: o["label"],
+        key="company_select",
+    )
+
+    st.caption(f"Showing up to {max_items} latest news items.")
     st.divider()
     if st.button("Logout"):
         st.session_state.is_authed = False
         st.session_state.remember_me = False
         st.rerun()
 
-
-company_query = st.session_state.get("company_query", "COROMANDEL")
 st.title("Results Viewer")
 
-actual = fetch_actual_doc(company_query)
-preview = fetch_preview_doc(company_query)
-
-if not actual and not preview:
-    st.warning("No documents found for this company.")
-    st.stop()
-
-# ========== ACTUAL DOC SECTION ==========
-if actual:
-    sym = actual.get("symbolmap", {})
-    st.subheader(sym.get("Company_Name") or sym.get("NSE") or "Company")
-    chips = []
-    chips.append(f'NSE {sym.get("NSE","-")}')
-    if sym.get("BSE"): chips.append(f'BSE {sym.get("BSE")}')
-    if actual.get("company"): chips.append(f'ISIN {actual.get("company")}')
-    chips.append(actual.get("category","-"))
-    if actual.get("subcategory"): chips.append(actual.get("subcategory","-"))
-    for c in chips: chip(c)
-
-    filed = actual.get("dt_tm","")
-    st.caption(f"Filed: {filed}")
-
-    # Sentiment/impact row
-    snt = (actual.get("sentiment") or "").lower()
-    snt_kind = "neg" if "neg" in snt else ("pos" if "pos" in snt else "")
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    chip(f"Sentiment: {actual.get('sentiment','-')}", snt_kind)
-    chip(f"Sensitivity: {actual.get('sensitivity','-')}")
-    chip(f"Timeline: {actual.get('timelineflag')}")
-    score = actual.get("impactscore")
-    chip(f"Impact Score: {score if score is not None else '-'} / 10")
-    try:
-        st.progress(float(score)/10)
-    except:
-        st.progress(0.0)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    # Short & detailed summaries
-    if actual.get("shortsummary"):
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("#### Short Summary")
-        st.write(actual["shortsummary"])
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    if actual.get("summary"):
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("#### Detailed Summary")
-        st.write(actual["summary"])
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    # PDF links (hypertext)
-    live = actual.get("pdf_link_live"); hist = actual.get("pdf_link")
-    if live or hist:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("**PDF Links**")
-        if live: st.markdown(f"- [Open Live PDF]({live})")
-        if hist: st.markdown(f"- [Open Historical PDF]({hist})")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    # Raw JSON expander
-    with st.expander("Raw JSON"):
-        st.json(actual)
+# ========== ALL ACTUAL NEWS FOR SELECTED COMPANY ==========
+docs = fetch_actual_docs(selected, limit=max_items)
+if not docs:
+    st.info("No news for this company.")
+else:
+    for i, doc in enumerate(docs, start=1):
+        st.markdown(f"#### News {i}")
+        render_actual_card(doc)
+        st.divider()
 
 # ========== PREDICTED RESULTS APPENDED AT END ==========
+preview_query = selected.get("nse") or selected.get("isin") or selected.get("name")
+preview = fetch_preview_doc(preview_query)
+
 if preview:
     st.markdown("### Predicted Results (from `company_result_previews`)")
 
@@ -253,12 +296,15 @@ if preview:
     ]
     for col, (label, val) in zip(kpi_cols, kpi_map):
         with col:
-            st.markdown(f'<div class="kpi"><div class="small">{label}</div><div style="font-size:20px;font-weight:700">{val if val is not None else "-"}</div></div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="kpi"><div class="small">{label}</div>'
+                f'<div style="font-size:20px;font-weight:700">{val if val is not None else "-"}</div></div>',
+                unsafe_allow_html=True
+            )
 
     # Broker table
     df = build_broker_df(preview)
     if not df.empty:
-        # If you have URLs in the 'PDF' column, render as link column
         if "http" in "".join(df["PDF"].astype(str).tolist()):
             st.dataframe(
                 df,
@@ -279,6 +325,5 @@ if preview:
         )
     else:
         st.info("No broker estimates found in preview doc.")
-
 else:
     st.info("No predicted results found for this company.")
