@@ -114,14 +114,17 @@ def _to_float_or_none(x):
         return float(x)
     except Exception:
         return None
+def fmt_money_cr(x):               # value already in crores
+    v = _to_float_or_none(x)
+    return "-" if v is None else f"₹ {v:,.1f} cr"
 
 def fmt1(x):  # 1-decimal with thousands
     v = _to_float_or_none(x)
     return "-" if v is None else f"{v:,.1f}"
 
-def fmt_money_mn(x):  # ₹ … mn, 1-decimal
-    v = _to_float_or_none(x)
-    return "-" if v is None else f"₹ {v:,.1f} mn"
+# def fmt_money_mn(x):  # ₹ … mn, 1-decimal
+#     v = _to_float_or_none(x)
+#     return "-" if v is None else f"₹ {v:,.1f} mn"
 
 def fmt_pct(x):  # 1-decimal % (no thousands)
     v = _to_float_or_none(x)
@@ -163,23 +166,22 @@ def build_broker_df(preview: Dict[str, Any]) -> pd.DataFrame:
 
     rows = []
     for b in (preview.get("broker_estimates") or []):
-        pdf_name = b.get("source_file") or b.get("report_id") or ""
-        source_url = b.get("source_url") or ""  # optional if you store it
+        pdf_name  = b.get("source_file") or b.get("report_id") or ""
+        source_url = b.get("source_url") or ""  # optional if you store URLs
         rows.append({
             "Broker": b.get("broker_name"),
             "Published": (b.get("published_date","") or "")[:10],
-            "Expected Sales (₹ mn)": r1(b.get("expected_sales")),
-            "Expected EBITDA (₹ mn)": r1(b.get("expected_ebitda")),
-            "Expected PAT (₹ mn)": r1(b.get("expected_pat")),
-            "EBITDA Margin %": r1(b.get("ebitda_margin_percent")),
-            "PAT Margin %": r1(b.get("pat_margin_percent")),
+            "Expected Sales (₹ cr)":  r1(b.get("expected_sales")),
+            "Expected EBITDA (₹ cr)": r1(b.get("expected_ebitda")),
+            "Expected PAT (₹ cr)":    r1(b.get("expected_pat")),
+            "EBITDA Margin %":        r1(b.get("ebitda_margin_percent")),
+            "PAT Margin %":           r1(b.get("pat_margin_percent")),
             "Commentary": b.get("commentary",""),
             "PDF": source_url or pdf_name,
         })
-    df = pd.DataFrame(rows)
 
-    # Ensure any numeric-looking objects are coerced & rounded to 1dp
-    for c in ["Expected Sales (₹ mn)","Expected EBITDA (₹ mn)","Expected PAT (₹ mn)",
+    df = pd.DataFrame(rows)
+    for c in ["Expected Sales (₹ cr)","Expected EBITDA (₹ cr)","Expected PAT (₹ cr)",
               "EBITDA Margin %","PAT Margin %"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").round(1)
@@ -356,9 +358,9 @@ if preview:
     cons = preview.get("consensus") or {}
 
     kpis = [
-        ("Expected Sales",  fmt_money_mn((cons.get("expected_sales") or {}).get("mean"))),
-        ("Expected EBITDA", fmt_money_mn((cons.get("expected_ebitda") or {}).get("mean"))),
-        ("Expected PAT",    fmt_money_mn((cons.get("expected_pat") or {}).get("mean"))),
+        ("Expected Sales",  fmt_money_cr((cons.get("expected_sales") or {}).get("mean"))),
+        ("Expected EBITDA", fmt_money_cr((cons.get("expected_ebitda") or {}).get("mean"))),
+        ("Expected PAT",    fmt_money_cr((cons.get("expected_pat") or {}).get("mean"))),
         ("EBITDA Margin %", fmt_pct((cons.get("ebitda_margin_percent") or {}).get("mean"))),
         ("PAT Margin %",    fmt_pct((cons.get("pat_margin_percent") or {}).get("mean"))),
     ]
@@ -371,6 +373,7 @@ if preview:
                 f'<div style="font-size:20px;font-weight:700">{val_str}</div></div>',
                 unsafe_allow_html=True
             )
+
 
 
     # Broker table
