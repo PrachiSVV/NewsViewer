@@ -38,24 +38,37 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # -------------------- AUTH --------------------
+
+
+# Initialize your own session keys (avoid "auth" name clash with form keys)
+if "is_authed" not in st.session_state:
+    st.session_state.is_authed = False
+if "remember_me" not in st.session_state:
+    st.session_state.remember_me = False
+
 def login_view():
     st.title("🔒 Login")
-    with st.form("auth"):
-        u = st.text_input("Username")
-        p = st.text_input("Password", type="password")
-        remember = st.checkbox("Remember me")
+
+    # Use a different form key and widget keys to avoid collisions
+    with st.form("login_form"):
+        u = st.text_input("Username", key="login_user")
+        p = st.text_input("Password", type="password", key="login_pass")
+        remember = st.checkbox("Remember me", key="login_remember")
         ok = st.form_submit_button("Sign in")
+
     if ok:
         if u == APP_USER and p == APP_PASS:
-            st.session_state["auth"] = True
-            st.session_state["remember"] = remember
-            st.rerun()
+            st.session_state.is_authed = True
+            st.session_state.remember_me = remember
+            st.rerun()  # or st.experimental_rerun() on older Streamlit
         else:
             st.error("Invalid credentials")
 
-if not st.session_state.get("auth"):
+# Gate
+if not st.session_state.get("is_authed"):
     login_view()
     st.stop()
+
 
 # -------------------- DB --------------------
 client = MongoClient(MONGO_URI)
@@ -153,7 +166,10 @@ with st.sidebar:
         st.rerun()
     st.divider()
     if st.button("Logout"):
-        st.session_state.clear(); st.rerun()
+        st.session_state.is_authed = False
+        st.session_state.remember_me = False
+        st.rerun()
+
 
 company_query = st.session_state.get("company_query", "COROMANDEL")
 st.title("Results Viewer")
