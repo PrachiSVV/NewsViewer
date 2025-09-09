@@ -285,6 +285,10 @@ def render_actual_card(doc: Dict[str, Any]):
     if impact_txt:
         st.markdown('<div class="section-title">Impact</div>', unsafe_allow_html=True)
         st.write(impact_txt)
+    impact_deduct = (doc.get("impactscore_deduction") or "").strip()
+    if impact_deduct:
+        st.markdown('<div class="section-title">Impactscore Deduction</div>', unsafe_allow_html=True)
+        st.write(impact_deduct)
 
 
     # Short & Detailed summaries
