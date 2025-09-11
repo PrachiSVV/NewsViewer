@@ -20,6 +20,10 @@ NEWS_COLL = os.getenv("NEWS_COLLECTION", "selected_ann")                # <- act
 PREV_DB   = os.getenv("PREV_DB", "CAG_CHATBOT")                         # <- previews live here if separate DB
 PREV_COLL = os.getenv("PREV_COLLECTION", "company_result_previews")     # <- predicted results
 
+# NEW: Actuals source (defaults to PREV_DB to be safe; override via .env if needed)
+ACTUAL_DB   = os.getenv("ACTUAL_DB", PREV_DB or DB_NAME)
+ACTUAL_COLL = os.getenv("ACTUAL_COLLECTION", "CollectionFinResMetrices")
+
 APP_USER  = os.getenv("APP_USER", "admin")
 APP_PASS  = os.getenv("APP_PASS", "admin123")
 
@@ -66,7 +70,6 @@ st.markdown("""
 
 
 # -------------------- AUTH --------------------
-# Initialize your own session keys (avoid "auth" name clash with form keys)
 if "is_authed" not in st.session_state:
     st.session_state.is_authed = False
 if "remember_me" not in st.session_state:
@@ -74,7 +77,6 @@ if "remember_me" not in st.session_state:
 
 def login_view():
     st.title("🔒 Login")
-    # Use a different form key and widget keys to avoid collisions
     with st.form("login_form"):
         u = st.text_input("Username", key="login_user")
         p = st.text_input("Password", type="password", key="login_pass")
@@ -85,7 +87,7 @@ def login_view():
         if u == APP_USER and p == APP_PASS:
             st.session_state.is_authed = True
             st.session_state.remember_me = remember
-            st.rerun()  # or st.experimental_rerun() on older Streamlit
+            st.rerun()
         else:
             st.error("Invalid credentials")
 
@@ -95,11 +97,14 @@ if not st.session_state.get("is_authed"):
     st.stop()
 
 # -------------------- DB --------------------
-client = MongoClient(MONGO_URI)
+client  = MongoClient(MONGO_URI)
 db_news = client[DB_NAME]
 col_news = db_news[NEWS_COLL]
 db_prev  = client[PREV_DB] if PREV_DB else db_news
 col_prev = db_prev[PREV_COLL]
+# NEW: actuals collection handle
+db_actual = client[ACTUAL_DB]
+col_fin   = db_actual[ACTUAL_COLL]
 
 # -------------------- HELPERS --------------------
 def _try_int(x):
@@ -109,11 +114,13 @@ def _try_int(x):
 def _parse_dt(s):
     try: return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
     except: return None
+
 def _to_float_or_none(x):
     try:
         return float(x)
     except Exception:
         return None
+
 def fmt_money_cr(x):               # value already in crores
     v = _to_float_or_none(x)
     return "-" if v is None else f"₹ {v:,.1f} cr"
@@ -122,14 +129,9 @@ def fmt1(x):  # 1-decimal with thousands
     v = _to_float_or_none(x)
     return "-" if v is None else f"{v:,.1f}"
 
-# def fmt_money_mn(x):  # ₹ … mn, 1-decimal
-#     v = _to_float_or_none(x)
-#     return "-" if v is None else f"₹ {v:,.1f} mn"
-
 def fmt_pct(x):  # 1-decimal % (no thousands)
     v = _to_float_or_none(x)
     return "-" if v is None else f"{v:.1f} %"
-
 
 def fetch_preview_doc(company_query: str) -> Optional[Dict[str, Any]]:
     q = (company_query or "").strip()
@@ -149,7 +151,7 @@ def fetch_preview_doc(company_query: str) -> Optional[Dict[str, Any]]:
         for k in ("updated_at","created_at"):
             v = d.get(k)
             if v:
-                try: return datetime.fromisoformat(v.replace("Z","+00:00"))
+                try: return datetime.fromisoformat(str(v).replace("Z","+00:00"))
                 except: pass
         return datetime.min
     docs.sort(key=keyer, reverse=True)
@@ -187,6 +189,115 @@ def build_broker_df(preview: Dict[str, Any]) -> pd.DataFrame:
             df[c] = pd.to_numeric(df[c], errors="coerce").round(1)
     return df
 
+# ---------- NEW: helpers for actuals fetch/format ----------
+_MONTHS = {"Jan":1,"Feb":2,"Mar":3,"Apr":4,"May":5,"Jun":6,"Jul":7,"Aug":8,"Sep":9,"Oct":10,"Nov":11,"Dec":12}
+
+def _period_to_dt(label: Optional[str]) -> datetime:
+    if not label:
+        return datetime.min
+    m = re.match(r"([A-Za-z]{3})[-]?(\d{4})", str(label).strip())
+    if not m:
+        return datetime.min
+    mon = _MONTHS.get(m.group(1)[:3].title(), 1)
+    yr  = int(m.group(2))
+    return datetime(yr, mon, 1)
+
+def _deep_get(d: Any, key: str) -> Optional[Any]:
+    if not isinstance(d, dict):
+        return None
+    if key in d:
+        return d[key]
+    for v in d.values():
+        if isinstance(v, dict):
+            got = _deep_get(v, key)
+            if got is not None:
+                return got
+    return None
+
+def _pick_any(doc: Dict[str, Any], candidates) -> Optional[Any]:
+    for k in candidates:
+        v = _deep_get(doc, k)
+        if v is not None:
+            return v
+    return None
+
+def fetch_actual_results(company_query: str,
+                         col_fin_handle,
+                         basis: Optional[str] = None,
+                         report_period: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    Returns a dict with keys: sales, ebitda, pat, ebitda_margin_percent, pat_margin_percent,
+    plus basis/report_period for display.
+    """
+    q = (company_query or "").strip()
+    if not q:
+        return None
+
+    or_filters = [
+        {"company_id": q.upper()},
+        {"symbolmap.NSE": q.upper()},
+        {"company_display": {"$regex": q, "$options":"i"}},
+        {"company_key": {"$regex": q, "$options":"i"}},
+        {"symbolmap.Company_Name": {"$regex": q, "$options":"i"}},
+    ]
+    filt: Dict[str, Any] = {"$or": or_filters}
+    if basis:
+        filt["basis"] = basis
+    if report_period:
+        filt["report_period"] = report_period
+
+    docs = list(col_fin_handle.find(filt))
+    if not docs and report_period:
+        # Retry without period if too tight
+        docs = list(col_fin_handle.find({"$or": or_filters, **({"basis": basis} if basis else {})}))
+        if not docs:
+            return None
+    elif not docs:
+        return None
+
+    def sort_key(d):
+        rp = _period_to_dt(d.get("report_period"))
+        if rp != datetime.min:
+            return (1, rp)
+        for k in ("updated_at", "created_at"):
+            v = d.get(k)
+            if v:
+                try:
+                    return (2, datetime.fromisoformat(str(v).replace("Z","+00:00")))
+                except:
+                    pass
+        return (0, datetime.min)
+
+    docs.sort(key=sort_key, reverse=True)
+    doc = docs[0]
+
+    sales   = _pick_any(doc, ["actual_sales","sales","net_sales","revenue","total_income"])
+    ebitda  = _pick_any(doc, ["actual_ebitda","ebitda"])
+    pat     = _pick_any(doc, ["actual_pat","pat","profit_after_tax","net_profit"])
+    e_marg  = _pick_any(doc, ["ebitda_margin_percent","ebitda_margin"])
+    p_marg  = _pick_any(doc, ["pat_margin_percent","pat_margin"])
+
+    return {
+        "sales": sales,
+        "ebitda": ebitda,
+        "pat": pat,
+        "ebitda_margin_percent": e_marg,
+        "pat_margin_percent": p_marg,
+        "basis": doc.get("basis"),
+        "report_period": doc.get("report_period"),
+    }
+
+def _safe_pct(val):
+    try:
+        return fmt_pct(val)
+    except:
+        return "-" if val is None else f"{float(val):.1f} %"
+
+def _safe_money(val):
+    try:
+        return fmt_money_cr(val)
+    except:
+        return "-" if val is None else str(val)
 
 # ---------- NEW: Dropdown options (only companies that have news) ----------
 @st.cache_data(ttl=600)
@@ -225,7 +336,6 @@ def fetch_actual_docs(opt: Dict[str, Any], limit: int = 50) -> List[Dict[str, An
     if opt.get("isin"): ors.append({"company": opt["isin"]})
     if opt.get("name"): ors.append({"symbolmap.Company_Name": opt["name"]})
     if not ors: return []
-    # dt_tm is "YYYY-MM-DD HH:MM:SS" so string sort works for chronological order
     return list(col_news.find({"$or": ors}).sort("dt_tm", -1).limit(limit))
 
 # ---------- NEW: Cleaner horizontal header + content ----------
@@ -234,7 +344,6 @@ def render_actual_card(doc: Dict[str, Any]):
     company = sym.get("Company_Name") or sym.get("NSE") or "Company"
     filed = doc.get("dt_tm", "")
 
-    # Header (horizontal)
     st.markdown('<div class="header-card">', unsafe_allow_html=True)
     st.markdown(
         f"""
@@ -246,7 +355,6 @@ def render_actual_card(doc: Dict[str, Any]):
         unsafe_allow_html=True
     )
 
-    # Company identifiers — one HTML block (horizontal pills)
     chips = []
     if sym.get("NSE"): chips.append(f'<span class="pill primary">NSE {sym.get("NSE")}</span>')
     if sym.get("BSE"): chips.append(f'<span class="pill primary">BSE {sym.get("BSE")}</span>')
@@ -256,31 +364,19 @@ def render_actual_card(doc: Dict[str, Any]):
     st.markdown(f'<div class="pills">{"".join(chips)}</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)  # close header-card
 
-    # Sentiment / impact — bold & eye-catching pills in ONE block
     sentiment = doc.get("sentiment", "-")
-    scls = "negative" if "neg" in sentiment.lower() else ("positive" if "pos" in sentiment.lower() else "")
-    # Pills block (keep your existing sentiment/sensitivity/timeline lines)
+    scls = "negative" if isinstance(sentiment, str) and ("neg" in sentiment.lower()) else ("positive" if isinstance(sentiment, str) and ("pos" in sentiment.lower()) else "")
     pills = [
         f'<span class="pill {scls}"><b>Sentiment:</b>&nbsp;{sentiment}</span>',
         f'<span class="pill"><b>Sensitivity:</b>&nbsp;{doc.get("sensitivity","-")}</span>',
         f'<span class="pill"><b>Timeline:</b>&nbsp;{doc.get("timelineflag")}</span>',
-        f'<span class="pill"><b>Impact Score:</b>&nbsp;{int(doc.get("impactscore"))}/10</span>',
+        f'<span class="pill"><b>Impact Score:</b>&nbsp;{int(_to_float_or_none(doc.get("impactscore")) or 0)}/10</span>',
     ]
     st.markdown(f'<div class="pills">{"".join(pills)}</div>', unsafe_allow_html=True)
-    
-    # Progress bar (numeric value, not formatted string)
+
     score_f = _to_float_or_none(doc.get("impactscore")) or 0.0
     st.progress(max(0.0, min(1.0, score_f/10.0)))
 
-    # st.markdown(f'<div class="pills">{"".join(pills)}</div>', unsafe_allow_html=True)
-
-    # # Optional progress bar (kept)
-    # try:
-    #     st.progress(float(doc.get("impactscore", 0)) / 10.0)
-    # except:
-    #     st.progress(0.0)
-
-    # Impact (NEW) — shown before Short Summary
     impact_txt = (doc.get("impact") or "").strip()
     if impact_txt:
         st.markdown('<div class="section-title">Impact</div>', unsafe_allow_html=True)
@@ -290,8 +386,6 @@ def render_actual_card(doc: Dict[str, Any]):
         st.markdown('<div class="section-title">Impactscore Deduction</div>', unsafe_allow_html=True)
         st.write(impact_deduct)
 
-
-    # Short & Detailed summaries
     if doc.get("shortsummary"):
         st.markdown('<div class="section-title">Short Summary</div>', unsafe_allow_html=True)
         st.write(doc["shortsummary"])
@@ -300,17 +394,14 @@ def render_actual_card(doc: Dict[str, Any]):
         st.markdown('<div class="section-title">Detailed Summary</div>', unsafe_allow_html=True)
         st.write(doc["summary"])
 
-    # PDF links
     live = doc.get("pdf_link_live"); hist = doc.get("pdf_link")
     if live or hist:
         st.markdown('<div class="section-title">PDF Links</div>', unsafe_allow_html=True)
         if live: st.markdown(f"- [Open Live PDF]({live})")
         if hist: st.markdown(f"- [Open Historical PDF]({hist})")
 
-    # Raw JSON (collapsed)
     with st.expander("Raw JSON"):
         st.json(doc)
-
 
 # -------------------- UI --------------------
 with st.sidebar:
@@ -320,8 +411,6 @@ with st.sidebar:
         st.error("No companies found in news collection.")
         st.stop()
 
-    # Number of news items to append (newest first)
-    # Default: min(20, count of first option)
     default_max = min(20, max(1, options[0]["count"]))
     max_items = st.slider("Max news to show", 1, 50, default_max, help="Show up to N latest news items")
     selected = st.selectbox(
@@ -351,36 +440,65 @@ else:
         render_actual_card(doc)
         st.divider()
 
-# ========== PREDICTED RESULTS APPENDED AT END ==========
+# ========== PREDICTED RESULTS + ACTUALS (VERTICAL TABLE) ==========
 preview_query = selected.get("nse") or selected.get("isin") or selected.get("name")
 preview = fetch_preview_doc(preview_query)
 
 if preview:
-    st.markdown("### Predicted Results (from `company_result_previews`)")
+    st.markdown("### Results vs Predictions")
 
-    # Consensus KPIs
+    # Consensus KPIs (predicted)
     cons = preview.get("consensus") or {}
+    pred_sales  = (cons.get("expected_sales") or {}).get("mean")
+    pred_ebitda = (cons.get("expected_ebitda") or {}).get("mean")
+    pred_pat    = (cons.get("expected_pat") or {}).get("mean")
+    pred_emarg  = (cons.get("ebitda_margin_percent") or {}).get("mean")
+    pred_pmarg  = (cons.get("pat_margin_percent") or {}).get("mean")
 
-    kpis = [
-        ("Expected Sales",  fmt_money_cr((cons.get("expected_sales") or {}).get("mean"))),
-        ("Expected EBITDA", fmt_money_cr((cons.get("expected_ebitda") or {}).get("mean"))),
-        ("Expected PAT",    fmt_money_cr((cons.get("expected_pat") or {}).get("mean"))),
-        ("EBITDA Margin %", fmt_pct((cons.get("ebitda_margin_percent") or {}).get("mean"))),
-        ("PAT Margin %",    fmt_pct((cons.get("pat_margin_percent") or {}).get("mean"))),
+    # Try aligning by preview's report period if present
+    rp = preview.get("report_period")
+    actual = fetch_actual_results(preview_query, col_fin_handle=col_fin, basis=None, report_period=rp) or {}
+
+    def _surprise_pct(pred, act):
+        try:
+            p = float(pred) if pred is not None else None
+            a = float(act)  if act  is not None else None
+            if p is None or a is None or p == 0.0:
+                return None
+            return (a - p) / p * 100.0
+        except:
+            return None
+
+    rows = [
+        ("Sales (₹ cr)",          pred_sales,  actual.get("sales")),
+        ("EBITDA (₹ cr)",         pred_ebitda, actual.get("ebitda")),
+        ("PAT (₹ cr)",            pred_pat,    actual.get("pat")),
+        ("EBITDA Margin (%)",     pred_emarg,  actual.get("ebitda_margin_percent")),
+        ("PAT Margin (%)",        pred_pmarg,  actual.get("pat_margin_percent")),
     ]
-    
-    kpi_cols = st.columns(len(kpis))
-    for col, (label, val_str) in zip(kpi_cols, kpis):
-        with col:
-            st.markdown(
-                f'<div class="kpi"><div class="small">{label}</div>'
-                f'<div style="font-size:20px;font-weight:700">{val_str}</div></div>',
-                unsafe_allow_html=True
-            )
 
+    table = []
+    for metric, pred, act in rows:
+        is_pct = "Margin" in metric
+        pred_disp = _safe_pct(pred) if is_pct else _safe_money(pred)
+        act_disp  = _safe_pct(act)  if is_pct else _safe_money(act)
+        surprise  = None if is_pct else _surprise_pct(pred, act)
+        table.append({
+            "Metric": metric,
+            "Predicted": pred_disp,
+            "Actual": act_disp,
+            "Surprise %": (f"{surprise:.1f} %" if surprise is not None else "-")
+        })
 
+    df_kpi = pd.DataFrame(table, columns=["Metric","Predicted","Actual","Surprise %"])
+    st.dataframe(df_kpi, hide_index=True, use_container_width=True)
 
-    # Broker table
+    # Context line
+    _basis = actual.get("basis") or "—"
+    _rper  = actual.get("report_period") or (rp or "—")
+    st.caption(f"Basis: {_basis} · Period: {_rper}")
+
+    # -------- Broker table (unchanged) --------
     df = build_broker_df(preview)
     if not df.empty:
         if "http" in "".join(df["PDF"].astype(str).tolist()):
