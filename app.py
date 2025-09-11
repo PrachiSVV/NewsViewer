@@ -100,7 +100,7 @@ col_news = db_news[NEWS_COLL]
 db_prev  = client[PREV_DB] if PREV_DB else db_news
 col_prev = db_prev[PREV_COLL]
 db_actual = client[ACTUAL_DB]
-col_fin   = db_actual[ACTUAL_COLL]
+col_fin   = db_news[ACTUAL_COLL]
 
 # -------------------- HELPERS --------------------
 def _try_int(x):
