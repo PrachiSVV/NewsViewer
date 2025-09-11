@@ -226,8 +226,8 @@ def fetch_actual_results(company_query: str,
                          basis: Optional[str] = None,
                          report_period: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
-    Returns a dict with keys: sales, ebitda, pat, ebitda_margin_percent, pat_margin_percent,
-    plus basis/report_period for display.
+    Fetch actuals from CollectionFinResMetrices.
+    Prefers results.Consolidated over Standalone; normalizes to ₹ crores; derives margins if possible.
     """
     q = (company_query or "").strip()
     if not q:
@@ -236,29 +236,34 @@ def fetch_actual_results(company_query: str,
     or_filters = [
         {"company_id": q.upper()},
         {"symbolmap.NSE": q.upper()},
+        {"company": q},  # ISIN exact
         {"company_display": {"$regex": q, "$options":"i"}},
         {"company_key": {"$regex": q, "$options":"i"}},
         {"symbolmap.Company_Name": {"$regex": q, "$options":"i"}},
     ]
     filt: Dict[str, Any] = {"$or": or_filters}
+    # Do NOT add report_period filter—this collection uses "period" / results[].period.label
     if basis:
-        filt["basis"] = basis
-    if report_period:
-        filt["report_period"] = report_period
+        # We won't filter by basis here because we prefer picking basis after fetch
+        pass
 
     docs = list(col_fin_handle.find(filt))
-    if not docs and report_period:
-        # Retry without period if too tight
-        docs = list(col_fin_handle.find({"$or": or_filters, **({"basis": basis} if basis else {})}))
-        if not docs:
-            return None
-    elif not docs:
+    if not docs:
         return None
 
+    # Sort: try latest results[].period.label, else updated_at/created_at
     def sort_key(d):
-        rp = _period_to_dt(d.get("report_period"))
-        if rp != datetime.min:
-            return (1, rp)
+        best_dt = datetime.min
+        res = (d.get("results") or {})
+        for key in ("Consolidated", "Standalone"):
+            arr = res.get(key) or []
+            for it in arr:
+                lbl = ((it.get("period") or {}).get("label")) or ""
+                dt = _parse_results_period_label(lbl)
+                if dt > best_dt:
+                    best_dt = dt
+        if best_dt != datetime.min:
+            return (3, best_dt)
         for k in ("updated_at", "created_at"):
             v = d.get(k)
             if v:
@@ -271,6 +276,19 @@ def fetch_actual_results(company_query: str,
     docs.sort(key=sort_key, reverse=True)
     doc = docs[0]
 
+    # 1) Prefer the structured "results" block
+    extracted = _extract_from_results(doc)
+    if extracted:
+        return extracted
+
+    # 2) Fallback: older/flat schemas (already in ₹ cr expected)
+    def _pick_any(doc: Dict[str, Any], candidates) -> Optional[Any]:
+        for k in candidates:
+            v = doc.get(k)
+            if v is not None:
+                return v
+        return None
+
     sales   = _pick_any(doc, ["actual_sales","sales","net_sales","revenue","total_income"])
     ebitda  = _pick_any(doc, ["actual_ebitda","ebitda"])
     pat     = _pick_any(doc, ["actual_pat","pat","profit_after_tax","net_profit"])
@@ -278,13 +296,13 @@ def fetch_actual_results(company_query: str,
     p_marg  = _pick_any(doc, ["pat_margin_percent","pat_margin"])
 
     return {
+        "basis": doc.get("basis"),
+        "period_label": doc.get("period"),
         "sales": sales,
         "ebitda": ebitda,
         "pat": pat,
         "ebitda_margin_percent": e_marg,
         "pat_margin_percent": p_marg,
-        "basis": doc.get("basis"),
-        "report_period": doc.get("report_period"),
     }
 
 def _safe_pct(val):
@@ -298,6 +316,90 @@ def _safe_money(val):
         return fmt_money_cr(val)
     except:
         return "-" if val is None else str(val)
+# --- Helpers for "results" extraction (CollectionFinResMetrices) ---
+def _parse_results_period_label(label: Optional[str]) -> datetime:
+    """Parse strings like 'Quarter ended 30-Jun-2025' -> datetime(2025,6,30)."""
+    if not label:
+        return datetime.min
+    m = re.search(r'(\d{1,2})-([A-Za-z]{3})-(\d{4})', str(label))
+    if not m:
+        return datetime.min
+    day = int(m.group(1))
+    mon = _MONTHS.get(m.group(2)[:3].title(), 1)
+    yr  = int(m.group(3))
+    return datetime(yr, mon, day)
+
+def _to_crores(val, unit: Optional[str]) -> Optional[float]:
+    """Normalize numeric to ₹ crores based on unit."""
+    v = _to_float_or_none(val)
+    if v is None:
+        return None
+    u = (unit or "").strip().lower()
+    if u in ("cr", "crore", "crores", "₹ cr", "inr cr"):
+        factor = 1.0
+    elif u in ("mn", "million", "millions"):
+        factor = 0.1         # 10 mn = 1 cr
+    elif u in ("bn", "billion", "billions"):
+        factor = 100.0       # 1 bn = 100 cr
+    else:
+        factor = 1.0         # assume already in crores if unknown
+    return v * factor
+
+def _extract_from_results(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Prefer Consolidated; else Standalone.
+    Pick the latest item by period.label date.
+    Return normalized crores and margins if derivable.
+    """
+    res = (doc.get("results") or {})
+    cons = res.get("Consolidated") or []
+    stand = res.get("Standalone") or []
+
+    basis = None
+    arr = None
+    if cons:
+        basis, arr = "Consolidated", cons
+    elif stand:
+        basis, arr = "Standalone", stand
+    else:
+        return None
+
+    # Pick latest by 'period.label' if present
+    def _key(it):
+        lbl = ((it.get("period") or {}).get("label")) or ""
+        return _parse_results_period_label(lbl)
+    arr_sorted = sorted(arr, key=_key, reverse=True)
+    item = arr_sorted[0]
+
+    metrics = (item.get("metrics") or {})
+    unit = metrics.get("unit")  # e.g., "mn"
+
+    # Pull values and normalize to ₹ crores
+    sales_cr  = _to_crores(metrics.get("Sales"), unit)
+    ebitda_cr = _to_crores(metrics.get("EBITDA") or metrics.get("Ebitda") or metrics.get("EBITDA_Profit"), unit)
+    pat_cr    = _to_crores(metrics.get("PAT") or metrics.get("Net_Profit") or metrics.get("Profit_After_Tax"), unit)
+
+    # Margins: use given ones if present, otherwise compute if possible
+    emargin = _to_float_or_none(metrics.get("EBITDA_Margin") or metrics.get("Ebitda_Margin") or metrics.get("EBITDA_Margin_%"))
+    pmargin = _to_float_or_none(metrics.get("PAT_Margin") or metrics.get("PAT_Margin_%"))
+
+    if emargin is None and ebitda_cr is not None and sales_cr not in (None, 0):
+        emargin = (ebitda_cr / sales_cr) * 100.0
+    if pmargin is None and pat_cr is not None and sales_cr not in (None, 0):
+        pmargin = (pat_cr / sales_cr) * 100.0
+
+    period_label = ((item.get("period") or {}).get("label")) or (doc.get("period") or None)
+
+    return {
+        "basis": basis,
+        "period_label": period_label,
+        "sales": sales_cr,
+        "ebitda": ebitda_cr,
+        "pat": pat_cr,
+        "ebitda_margin_percent": emargin,
+        "pat_margin_percent": pmargin,
+    }
+
 
 # ---------- NEW: Dropdown options (only companies that have news) ----------
 @st.cache_data(ttl=600)
@@ -495,7 +597,7 @@ if preview:
 
     # Context line
     _basis = actual.get("basis") or "—"
-    _rper  = actual.get("report_period") or (rp or "—")
+    _rper  = actual.get("period_label") or (preview.get("report_period") or "—")
     st.caption(f"Basis: {_basis} · Period: {_rper}")
 
     # -------- Broker table (unchanged) --------
