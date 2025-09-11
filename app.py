@@ -20,9 +20,9 @@ NEWS_COLL = os.getenv("NEWS_COLLECTION", "selected_ann")                # <- act
 PREV_DB   = os.getenv("PREV_DB", "CAG_CHATBOT")                         # <- previews live here if separate DB
 PREV_COLL = os.getenv("PREV_COLLECTION", "company_result_previews")     # <- predicted results
 
-# NEW: Actuals source (defaults to PREV_DB to be safe; override via .env if needed)
-ACTUAL_DB   = os.getenv("ACTUAL_DB", PREV_DB or DB_NAME)
-ACTUAL_COLL = os.getenv("ACTUAL_COLLECTION", "CollectionFinResMetrices")
+# Actuals source -> LatestCmotData
+ACTUAL_DB   = os.getenv("ACTUAL_DB", DB_NAME)                           # set ACTUAL_DB in .env if different
+ACTUAL_COLL = os.getenv("ACTUAL_COLLECTION", "LatestCmotData")
 
 APP_USER  = os.getenv("APP_USER", "admin")
 APP_PASS  = os.getenv("APP_PASS", "admin123")
@@ -50,11 +50,9 @@ st.markdown("""
 """, unsafe_allow_html=True)
 st.markdown("""
 <style>
-/* --- Horizontal header + compact pills --- */
 .header-line{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
 .company-name{font-size:20px;font-weight:800;letter-spacing:.2px}
 .meta{color:#666;font-size:12px}
-
 .pills{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:6px}
 .pill{
   display:inline-flex;align-items:center;
@@ -67,7 +65,6 @@ st.markdown("""
 .section-title{font-weight:800;margin:10px 0 8px 0}
 </style>
 """, unsafe_allow_html=True)
-
 
 # -------------------- AUTH --------------------
 if "is_authed" not in st.session_state:
@@ -97,56 +94,94 @@ if not st.session_state.get("is_authed"):
     st.stop()
 
 # -------------------- DB --------------------
-client  = MongoClient(MONGO_URI)
-db_news = client[DB_NAME]
+client   = MongoClient(MONGO_URI)
+db_news  = client[DB_NAME]
 col_news = db_news[NEWS_COLL]
 db_prev  = client[PREV_DB] if PREV_DB else db_news
 col_prev = db_prev[PREV_COLL]
-# NEW: actuals collection handle
-# db_actual = client[ACTUAL_DB]
-col_fin   = db_news[ACTUAL_COLL]
+db_actual = client[ACTUAL_DB]
+col_fin   = db_actual[ACTUAL_COLL]
 
 # -------------------- HELPERS --------------------
 def _try_int(x):
     try: return int(str(x).strip())
     except: return None
 
-def _parse_dt(s):
-    try: return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-    except: return None
-
 def _to_float_or_none(x):
-    try:
-        return float(x)
-    except Exception:
-        return None
+    try: return float(x)
+    except Exception: return None
 
-def fmt_money_cr(x):               # value already in crores
+def fmt_money_cr(x):               # value in crores
     v = _to_float_or_none(x)
     return "-" if v is None else f"₹ {v:,.1f} cr"
 
-def fmt1(x):  # 1-decimal with thousands
+def fmt1(x):
     v = _to_float_or_none(x)
     return "-" if v is None else f"{v:,.1f}"
 
-def fmt_pct(x):  # 1-decimal % (no thousands)
+def fmt_pct(x):
     v = _to_float_or_none(x)
     return "-" if v is None else f"{v:.1f} %"
 
+# Month mapping for period parsing
+_MONTHS = {"Jan":1,"Feb":2,"Mar":3,"Apr":4,"May":5,"Jun":6,"Jul":7,"Aug":8,"Sep":9,"Oct":10,"Nov":11,"Dec":12}
+
+def _period_to_dt(label: Optional[str]) -> datetime:
+    """
+    Parse 'Jun2025' or 'Jun-2025' -> datetime(2025,6,1)
+    """
+    if not label:
+        return datetime.min
+    m = re.match(r"([A-Za-z]{3})-?(\d{4})", str(label).strip())
+    if not m:
+        return datetime.min
+    mon = _MONTHS.get(m.group(1)[:3].title(), 1)
+    yr  = int(m.group(2))
+    return datetime(yr, mon, 1)
+
+def _parse_results_period_label(label: Optional[str]) -> datetime:
+    """Parse 'Quarter ended 30-Jun-2025' -> datetime(2025,6,30)."""
+    if not label:
+        return datetime.min
+    m = re.search(r'(\d{1,2})-([A-Za-z]{3})-(\d{4})', str(label))
+    if not m:
+        return datetime.min
+    day = int(m.group(1)); mon = _MONTHS.get(m.group(2)[:3].title(), 1); yr = int(m.group(3))
+    return datetime(yr, mon, day)
+
+def _to_crores(val, unit: Optional[str]) -> Optional[float]:
+    """
+    Normalize numeric to ₹ crores.
+    For LatestCmotData you already store 'unit': 'cr' -> factor 1.0 (safe no-op).
+    """
+    v = _to_float_or_none(val)
+    if v is None: return None
+    u = (unit or "").strip().lower()
+    if u in ("cr","crore","crores","₹ cr","inr cr"): factor = 1.0
+    elif u in ("mn","million","millions"): factor = 0.1
+    elif u in ("bn","billion","billions"): factor = 100.0
+    else: factor = 1.0
+    return v * factor
+
+# -------- Preview (predictions) --------
 def fetch_preview_doc(company_query: str) -> Optional[Dict[str, Any]]:
     q = (company_query or "").strip()
-    if not q:
-        return None
+    if not q: return None
     or_filters = [
         {"company_id": q.upper()},
         {"symbolmap.NSE": q.upper()},
         {"company_display": {"$regex": q, "$options":"i"}},
         {"company_key": {"$regex": q, "$options":"i"}},
         {"symbolmap.Company_Name": {"$regex": q, "$options":"i"}},
+        {"company": q.upper()},  # ISIN exact
     ]
+    if q.isdigit():
+        try: or_filters.append({"symbolmap.BSE": int(q)})
+        except: pass
+
     docs = list(col_prev.find({"$or": or_filters}))
-    if not docs:
-        return None
+    if not docs: return None
+
     def keyer(d):
         for k in ("updated_at","created_at"):
             v = d.get(k)
@@ -154,6 +189,7 @@ def fetch_preview_doc(company_query: str) -> Optional[Dict[str, Any]]:
                 try: return datetime.fromisoformat(str(v).replace("Z","+00:00"))
                 except: pass
         return datetime.min
+
     docs.sort(key=keyer, reverse=True)
     return docs[0]
 
@@ -168,8 +204,8 @@ def build_broker_df(preview: Dict[str, Any]) -> pd.DataFrame:
 
     rows = []
     for b in (preview.get("broker_estimates") or []):
-        pdf_name  = b.get("source_file") or b.get("report_id") or ""
-        source_url = b.get("source_url") or ""  # optional if you store URLs
+        pdf_name   = b.get("source_file") or b.get("report_id") or ""
+        source_url = b.get("source_url") or ""
         rows.append({
             "Broker": b.get("broker_name"),
             "Published": (b.get("published_date","") or "")[:10],
@@ -189,207 +225,95 @@ def build_broker_df(preview: Dict[str, Any]) -> pd.DataFrame:
             df[c] = pd.to_numeric(df[c], errors="coerce").round(1)
     return df
 
-# ---------- NEW: helpers for actuals fetch/format ----------
-_MONTHS = {"Jan":1,"Feb":2,"Mar":3,"Apr":4,"May":5,"Jun":6,"Jul":7,"Aug":8,"Sep":9,"Oct":10,"Nov":11,"Dec":12}
-
-def _period_to_dt(label: Optional[str]) -> datetime:
-    if not label:
-        return datetime.min
-    m = re.match(r"([A-Za-z]{3})[-]?(\d{4})", str(label).strip())
-    if not m:
-        return datetime.min
-    mon = _MONTHS.get(m.group(1)[:3].title(), 1)
-    yr  = int(m.group(2))
-    return datetime(yr, mon, 1)
-
-def _deep_get(d: Any, key: str) -> Optional[Any]:
-    if not isinstance(d, dict):
-        return None
-    if key in d:
-        return d[key]
-    for v in d.values():
-        if isinstance(v, dict):
-            got = _deep_get(v, key)
-            if got is not None:
-                return got
-    return None
-
-def _pick_any(doc: Dict[str, Any], candidates) -> Optional[Any]:
-    for k in candidates:
-        v = _deep_get(doc, k)
-        if v is not None:
-            return v
-    return None
-
-def fetch_actual_results(company_query: str,
-                         col_fin_handle,
-                         basis: Optional[str] = None,
-                         report_period: Optional[str] = None) -> Optional[Dict[str, Any]]:
+# -------- Actuals (LatestCmotData) extractors --------
+def _extract_from_latest_cmot(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Fetch actuals from CollectionFinResMetrices.
-    Prefers results.Consolidated over Standalone; normalizes to ₹ crores; derives margins if possible.
-    """
-    q = (company_query or "").strip()
-    if not q:
-        return None
-
-    or_filters = [
-        {"company_id": q.upper()},
-        {"symbolmap.NSE": q.upper()},
-        {"company": q},  # ISIN exact
-        {"company_display": {"$regex": q, "$options":"i"}},
-        {"company_key": {"$regex": q, "$options":"i"}},
-        {"symbolmap.Company_Name": {"$regex": q, "$options":"i"}},
-    ]
-    filt: Dict[str, Any] = {"$or": or_filters}
-    # Do NOT add report_period filter—this collection uses "period" / results[].period.label
-    if basis:
-        # We won't filter by basis here because we prefer picking basis after fetch
-        pass
-
-    docs = list(col_fin_handle.find(filt))
-    if not docs:
-        return None
-
-    # Sort: try latest results[].period.label, else updated_at/created_at
-    def sort_key(d):
-        best_dt = datetime.min
-        res = (d.get("results") or {})
-        for key in ("Consolidated", "Standalone"):
-            arr = res.get(key) or []
-            for it in arr:
-                lbl = ((it.get("period") or {}).get("label")) or ""
-                dt = _parse_results_period_label(lbl)
-                if dt > best_dt:
-                    best_dt = dt
-        if best_dt != datetime.min:
-            return (3, best_dt)
-        for k in ("updated_at", "created_at"):
-            v = d.get(k)
-            if v:
-                try:
-                    return (2, datetime.fromisoformat(str(v).replace("Z","+00:00")))
-                except:
-                    pass
-        return (0, datetime.min)
-
-    docs.sort(key=sort_key, reverse=True)
-    doc = docs[0]
-
-    # 1) Prefer the structured "results" block
-    extracted = _extract_from_results(doc)
-    if extracted:
-        return extracted
-
-    # 2) Fallback: older/flat schemas (already in ₹ cr expected)
-    def _pick_any(doc: Dict[str, Any], candidates) -> Optional[Any]:
-        for k in candidates:
-            v = doc.get(k)
-            if v is not None:
-                return v
-        return None
-
-    sales   = _pick_any(doc, ["actual_sales","sales","net_sales","revenue","total_income"])
-    ebitda  = _pick_any(doc, ["actual_ebitda","ebitda"])
-    pat     = _pick_any(doc, ["actual_pat","pat","profit_after_tax","net_profit"])
-    e_marg  = _pick_any(doc, ["ebitda_margin_percent","ebitda_margin"])
-    p_marg  = _pick_any(doc, ["pat_margin_percent","pat_margin"])
-
-    return {
-        "basis": doc.get("basis"),
-        "period_label": doc.get("period"),
-        "sales": sales,
-        "ebitda": ebitda,
-        "pat": pat,
-        "ebitda_margin_percent": e_marg,
-        "pat_margin_percent": p_marg,
-    }
-
-def _safe_pct(val):
-    try:
-        return fmt_pct(val)
-    except:
-        return "-" if val is None else f"{float(val):.1f} %"
-
-def _safe_money(val):
-    try:
-        return fmt_money_cr(val)
-    except:
-        return "-" if val is None else str(val)
-# --- Helpers for "results" extraction (CollectionFinResMetrices) ---
-def _parse_results_period_label(label: Optional[str]) -> datetime:
-    """Parse strings like 'Quarter ended 30-Jun-2025' -> datetime(2025,6,30)."""
-    if not label:
-        return datetime.min
-    m = re.search(r'(\d{1,2})-([A-Za-z]{3})-(\d{4})', str(label))
-    if not m:
-        return datetime.min
-    day = int(m.group(1))
-    mon = _MONTHS.get(m.group(2)[:3].title(), 1)
-    yr  = int(m.group(3))
-    return datetime(yr, mon, day)
-
-def _to_crores(val, unit: Optional[str]) -> Optional[float]:
-    """Normalize numeric to ₹ crores based on unit."""
-    v = _to_float_or_none(val)
-    if v is None:
-        return None
-    u = (unit or "").strip().lower()
-    if u in ("cr", "crore", "crores", "₹ cr", "inr cr"):
-        factor = 1.0
-    elif u in ("mn", "million", "millions"):
-        factor = 0.1         # 10 mn = 1 cr
-    elif u in ("bn", "billion", "billions"):
-        factor = 100.0       # 1 bn = 100 cr
-    else:
-        factor = 1.0         # assume already in crores if unknown
-    return v * factor
-
-def _extract_from_results(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
+    LatestCmotData structure:
+      - doc["Consolidated"] or doc["Standalone"] is a dict of { "Jun2025": {...}, "actual": {"Jun2025": {... unit: 'cr'}} }
     Prefer Consolidated; else Standalone.
-    Pick the latest item by period.label date.
-    Return normalized crores and margins if derivable.
+    Use 'actual' if present, else latest quarter key.
     """
+    for basis in ("Consolidated", "Standalone"):
+        block = doc.get(basis)
+        if not isinstance(block, dict):
+            continue
+
+        # 1) Prefer 'actual' sub-block
+        actual_block = block.get("actual")
+        if isinstance(actual_block, dict) and actual_block:
+            # pick latest period from keys like "Jun2025"
+            period_keys = [k for k in actual_block.keys() if k and isinstance(k, str)]
+            period_keys.sort(key=lambda x: _period_to_dt(x), reverse=True)
+            sel_key = period_keys[0]
+            m = actual_block.get(sel_key) or {}
+            unit = m.get("unit")  # already 'cr'
+            sales  = _to_crores(m.get("net_sales"),  unit)
+            ebitda = _to_crores(m.get("ebitda"),     unit)
+            pat    = _to_crores(m.get("net_profit"), unit)
+            emarg  = _to_float_or_none(m.get("ebitda_margin"))
+            pmarg  = _to_float_or_none(m.get("pat_margin"))
+            return {
+                "basis": basis,
+                "period_label": sel_key,
+                "sales": sales,
+                "ebitda": ebitda,
+                "pat": pat,
+                "ebitda_margin_percent": emarg,
+                "pat_margin_percent": pmarg,
+            }
+
+        # 2) Fallback to latest quarter entry in the block (exclude the 'actual' key)
+        quarter_keys = [k for k in block.keys() if k != "actual" and isinstance(block.get(k), dict)]
+        if quarter_keys:
+            quarter_keys.sort(key=lambda x: _period_to_dt(x), reverse=True)
+            sel_key = quarter_keys[0]
+            m = block.get(sel_key) or {}
+            # assume values in crores already
+            sales  = _to_float_or_none(m.get("net_sales"))
+            ebitda = _to_float_or_none(m.get("ebitda") or m.get("operating_profit"))
+            pat    = _to_float_or_none(m.get("net_profit"))
+            emarg  = _to_float_or_none(m.get("ebitda_margin"))
+            pmarg  = _to_float_or_none(m.get("pat_margin"))
+            return {
+                "basis": basis,
+                "period_label": sel_key,
+                "sales": sales,
+                "ebitda": ebitda,
+                "pat": pat,
+                "ebitda_margin_percent": emarg,
+                "pat_margin_percent": pmarg,
+            }
+    return None
+
+# Backward-compat extractor (older 'results' schema) — kept for safety
+def _extract_from_results(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     res = (doc.get("results") or {})
     cons = res.get("Consolidated") or []
     stand = res.get("Standalone") or []
+    basis = arr = None
+    if cons: basis, arr = "Consolidated", cons
+    elif stand: basis, arr = "Standalone", stand
+    else: return None
 
-    basis = None
-    arr = None
-    if cons:
-        basis, arr = "Consolidated", cons
-    elif stand:
-        basis, arr = "Standalone", stand
-    else:
-        return None
-
-    # Pick latest by 'period.label' if present
     def _key(it):
         lbl = ((it.get("period") or {}).get("label")) or ""
         return _parse_results_period_label(lbl)
     arr_sorted = sorted(arr, key=_key, reverse=True)
     item = arr_sorted[0]
+    metrics = (item.get("metrics") or {}); unit = metrics.get("unit")
 
-    metrics = (item.get("metrics") or {})
-    unit = metrics.get("unit")  # e.g., "mn"
-
-    # Pull values and normalize to ₹ crores
     sales_cr  = _to_crores(metrics.get("Sales"), unit)
     ebitda_cr = _to_crores(metrics.get("EBITDA") or metrics.get("Ebitda") or metrics.get("EBITDA_Profit"), unit)
     pat_cr    = _to_crores(metrics.get("PAT") or metrics.get("Net_Profit") or metrics.get("Profit_After_Tax"), unit)
+    emargin   = _to_float_or_none(metrics.get("EBITDA_Margin") or metrics.get("Ebitda_Margin") or metrics.get("EBITDA_Margin_%"))
+    pmargin   = _to_float_or_none(metrics.get("PAT_Margin") or metrics.get("PAT_Margin_%"))
 
-    # Margins: use given ones if present, otherwise compute if possible
-    emargin = _to_float_or_none(metrics.get("EBITDA_Margin") or metrics.get("Ebitda_Margin") or metrics.get("EBITDA_Margin_%"))
-    pmargin = _to_float_or_none(metrics.get("PAT_Margin") or metrics.get("PAT_Margin_%"))
-
-    if emargin is None and ebitda_cr is not None and sales_cr not in (None, 0):
+    if emargin is None and ebitda_cr and sales_cr:
         emargin = (ebitda_cr / sales_cr) * 100.0
-    if pmargin is None and pat_cr is not None and sales_cr not in (None, 0):
+    if pmargin is None and pat_cr and sales_cr:
         pmargin = (pat_cr / sales_cr) * 100.0
 
     period_label = ((item.get("period") or {}).get("label")) or (doc.get("period") or None)
-
     return {
         "basis": basis,
         "period_label": period_label,
@@ -400,14 +324,96 @@ def _extract_from_results(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "pat_margin_percent": pmargin,
     }
 
+def fetch_preview_doc_query(selected: Dict[str, Any]) -> Optional[str]:
+    return (
+        selected.get("nse")
+        or selected.get("isin")
+        or selected.get("name")
+        or (str(selected.get("bse")) if selected.get("bse") is not None else None)
+    )
 
-# ---------- NEW: Dropdown options (only companies that have news) ----------
+def fetch_actual_results(company_query: str,
+                         col_fin_handle,
+                         basis: Optional[str] = None,
+                         report_period: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    Fetch actuals from LatestCmotData (preferred) with fallback to older 'results' schema.
+    """
+    q = (company_query or "").strip()
+    if not q:
+        return None
+
+    or_filters = [
+        {"company_id": q.upper()},
+        {"symbolmap.NSE": q.upper()},
+        {"company": q.upper()},  # ISIN
+        {"company_display": {"$regex": q, "$options":"i"}},
+        {"company_key": {"$regex": q, "$options":"i"}},
+        {"symbolmap.Company_Name": {"$regex": q, "$options":"i"}},
+    ]
+    if q.isdigit():
+        try: or_filters.append({"symbolmap.BSE": int(q)})
+        except: pass
+
+    docs = list(col_fin_handle.find({"$or": or_filters}))
+    if not docs:
+        return None
+
+    def sort_key(d):
+        # Prefer updated_at if present
+        v = d.get("updated_at")
+        if v:
+            try: return (2, datetime.fromisoformat(str(v).replace("Z","+00:00")))
+            except: pass
+        return (0, datetime.min)
+
+    docs.sort(key=sort_key, reverse=True)
+    doc = docs[0]
+
+    # 1) LatestCmotData path
+    extracted = _extract_from_latest_cmot(doc)
+    if extracted:
+        return extracted
+
+    # 2) Fallback: older 'results' array style
+    extracted2 = _extract_from_results(doc)
+    if extracted2:
+        return extracted2
+
+    # 3) Final fallback: flat keys (rare)
+    def _deep_get(d: Any, key: str) -> Optional[Any]:
+        if not isinstance(d, dict): return None
+        if key in d: return d[key]
+        for v in d.values():
+            if isinstance(v, dict):
+                got = _deep_get(v, key)
+                if got is not None: return got
+        return None
+
+    def _pick_any(doc_: Dict[str, Any], candidates) -> Optional[Any]:
+        for k in candidates:
+            v = _deep_get(doc_, k)
+            if v is not None: return v
+        return None
+
+    sales   = _pick_any(doc, ["actual_sales","sales","net_sales","revenue","total_income"])
+    ebitda  = _pick_any(doc, ["actual_ebitda","ebitda","operating_profit"])
+    pat     = _pick_any(doc, ["actual_pat","pat","net_profit","profit_after_tax","net_profit"])
+    e_marg  = _pick_any(doc, ["ebitda_margin_percent","ebitda_margin"])
+    p_marg  = _pick_any(doc, ["pat_margin_percent","pat_margin"])
+    return {
+        "basis": doc.get("basis"),
+        "period_label": doc.get("period"),
+        "sales": _to_float_or_none(sales),
+        "ebitda": _to_float_or_none(ebitda),
+        "pat": _to_float_or_none(pat),
+        "ebitda_margin_percent": _to_float_or_none(e_marg),
+        "pat_margin_percent": _to_float_or_none(p_marg),
+    }
+
+# ---------- Dropdown options (only companies that have news) ----------
 @st.cache_data(ttl=600)
 def get_company_options() -> List[Dict[str, Any]]:
-    """
-    Build a dropdown list of companies that have news in NEWS_COLL.
-    Label: Company_Name — NSE X | BSE Y | ISIN Z  (count)
-    """
     pipeline = [
         {"$group": {"_id": {
             "nse": "$symbolmap.NSE",
@@ -421,17 +427,13 @@ def get_company_options() -> List[Dict[str, Any]]:
     out = []
     for it in items:
         _id = it["_id"] or {}
-        nse = _id.get("nse")
-        bse = _id.get("bse")
-        name = _id.get("name")
-        isin = _id.get("isin")
+        nse = _id.get("nse"); bse = _id.get("bse"); name = _id.get("name"); isin = _id.get("isin")
         label = f"{name or nse or isin or bse} — NSE {nse or '-'} | BSE {bse or '-'} | ISIN {isin or '-'}  ({it['count']})"
         out.append({"label": label, "nse": nse, "bse": bse, "name": name, "isin": isin, "count": it["count"]})
     return out
 
-# ---------- NEW: Fetch ALL news docs for selected company ----------
+# ---------- Fetch ALL news docs for selected company ----------
 def fetch_actual_docs(opt: Dict[str, Any], limit: int = 50) -> List[Dict[str, Any]]:
-    """Fetch news docs for the selected company, newest first."""
     ors = []
     if opt.get("nse"):  ors.append({"symbolmap.NSE": opt["nse"]})
     if opt.get("bse"):  ors.append({"symbolmap.BSE": opt["bse"]})
@@ -440,7 +442,7 @@ def fetch_actual_docs(opt: Dict[str, Any], limit: int = 50) -> List[Dict[str, An
     if not ors: return []
     return list(col_news.find({"$or": ors}).sort("dt_tm", -1).limit(limit))
 
-# ---------- NEW: Cleaner horizontal header + content ----------
+# ---------- Render a news card ----------
 def render_actual_card(doc: Dict[str, Any]):
     sym = doc.get("symbolmap", {}) or {}
     company = sym.get("Company_Name") or sym.get("NSE") or "Company"
@@ -464,7 +466,7 @@ def render_actual_card(doc: Dict[str, Any]):
     if doc.get("category"): chips.append(f'<span class="pill">{doc.get("category")}</span>')
     if doc.get("subcategory"): chips.append(f'<span class="pill">{doc.get("subcategory")}</span>')
     st.markdown(f'<div class="pills">{"".join(chips)}</div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)  # close header-card
+    st.markdown('</div>', unsafe_allow_html=True)
 
     sentiment = doc.get("sentiment", "-")
     scls = "negative" if isinstance(sentiment, str) and ("neg" in sentiment.lower()) else ("positive" if isinstance(sentiment, str) and ("pos" in sentiment.lower()) else "")
@@ -476,8 +478,8 @@ def render_actual_card(doc: Dict[str, Any]):
     ]
     st.markdown(f'<div class="pills">{"".join(pills)}</div>', unsafe_allow_html=True)
 
-    score_f = _to_float_or_none(doc.get("impactscore")) or 0.0
-    st.progress(max(0.0, min(1.0, score_f/10.0)))
+    score_f = _to_float_or_none(doc.get("impactscore")) or 0.0  # 0..10
+    st.progress(min(100, max(0, int(round(score_f * 10)))))     # 0..100
 
     impact_txt = (doc.get("impact") or "").strip()
     if impact_txt:
@@ -543,8 +545,8 @@ else:
         st.divider()
 
 # ========== PREDICTED RESULTS + ACTUALS (VERTICAL TABLE) ==========
-preview_query = selected.get("nse") or selected.get("isin") or selected.get("name")
-preview = fetch_preview_doc(preview_query)
+preview_query = fetch_preview_doc_query(selected)
+preview = fetch_preview_doc(preview_query) if preview_query else None
 
 if preview:
     st.markdown("### Results vs Predictions")
@@ -557,33 +559,30 @@ if preview:
     pred_emarg  = (cons.get("ebitda_margin_percent") or {}).get("mean")
     pred_pmarg  = (cons.get("pat_margin_percent") or {}).get("mean")
 
-    # Try aligning by preview's report period if present
-    rp = preview.get("report_period")
-    actual = fetch_actual_results(preview_query, col_fin_handle=col_fin, basis=None, report_period=rp) or {}
+    # Actuals
+    actual = fetch_actual_results(preview_query, col_fin_handle=col_fin) or {}
 
     def _surprise_pct(pred, act):
         try:
             p = float(pred) if pred is not None else None
             a = float(act)  if act  is not None else None
-            if p is None or a is None or p == 0.0:
-                return None
+            if p is None or a is None or p == 0.0: return None
             return (a - p) / p * 100.0
-        except:
-            return None
+        except: return None
 
     rows = [
-        ("Sales (₹ cr)",          pred_sales,  actual.get("sales")),
-        ("EBITDA (₹ cr)",         pred_ebitda, actual.get("ebitda")),
-        ("PAT (₹ cr)",            pred_pat,    actual.get("pat")),
-        ("EBITDA Margin (%)",     pred_emarg,  actual.get("ebitda_margin_percent")),
-        ("PAT Margin (%)",        pred_pmarg,  actual.get("pat_margin_percent")),
+        ("Sales (₹ cr)",      pred_sales,  actual.get("sales")),
+        ("EBITDA (₹ cr)",     pred_ebitda, actual.get("ebitda")),
+        ("PAT (₹ cr)",        pred_pat,    actual.get("pat")),
+        ("EBITDA Margin (%)", pred_emarg,  actual.get("ebitda_margin_percent")),
+        ("PAT Margin (%)",    pred_pmarg,  actual.get("pat_margin_percent")),
     ]
 
     table = []
     for metric, pred, act in rows:
         is_pct = "Margin" in metric
-        pred_disp = _safe_pct(pred) if is_pct else _safe_money(pred)
-        act_disp  = _safe_pct(act)  if is_pct else _safe_money(act)
+        pred_disp = fmt_pct(pred) if is_pct else fmt_money_cr(pred)
+        act_disp  = fmt_pct(act)  if is_pct else fmt_money_cr(act)
         surprise  = None if is_pct else _surprise_pct(pred, act)
         table.append({
             "Metric": metric,
@@ -595,7 +594,6 @@ if preview:
     df_kpi = pd.DataFrame(table, columns=["Metric","Predicted","Actual","Surprise %"])
     st.dataframe(df_kpi, hide_index=True, use_container_width=True)
 
-    # Context line
     _basis = actual.get("basis") or "—"
     _rper  = actual.get("period_label") or (preview.get("report_period") or "—")
     st.caption(f"Basis: {_basis} · Period: {_rper}")
@@ -607,9 +605,7 @@ if preview:
             st.dataframe(
                 df,
                 hide_index=True,
-                column_config={
-                    "PDF": st.column_config.LinkColumn("PDF", help="Open source document")
-                },
+                column_config={"PDF": st.column_config.LinkColumn("PDF", help="Open source document")},
                 use_container_width=True,
             )
         else:
