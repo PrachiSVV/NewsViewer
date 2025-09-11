@@ -104,7 +104,7 @@ db_prev  = client[PREV_DB] if PREV_DB else db_news
 col_prev = db_prev[PREV_COLL]
 # NEW: actuals collection handle
 # db_actual = client[ACTUAL_DB]
-col_fin   = db_prev[ACTUAL_COLL]
+col_fin   = db_news[ACTUAL_COLL]
 
 # -------------------- HELPERS --------------------
 def _try_int(x):
